@@ -1,0 +1,206 @@
+name: CI/CD to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ec2-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: chucknorris
+  NODE_VERSION: 20
+  ARTIFACT_NAME: chucknorris-${{ github.sha }}.tar.gz
+  ARTIFACT_PATH: dist/chucknorris-${{ github.sha }}.tar.gz
+  S3_URI: s3://${{ secrets.S3_BUCKET }}/chucknorris/${{ github.sha }}/chucknorris-${{ github.sha }}.tar.gz
+  APP_DIR: ${{ secrets.EC2_APP_DIR || '/opt/chucknorris' }}
+  APP_PORT: ${{ secrets.APP_PORT || '3000' }}
+  EC2_PORT: ${{ secrets.EC2_PORT || '22' }}
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+  SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+jobs:
+  build-test-scan-package:
+    name: Build, Test, Scan, and Package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Stage 1 - Checkout source
+        uses: actions/checkout@v4
+
+      - name: Stage 2 - Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Stage 3 - Verify Node and npm
+        run: |
+          node --version
+          npm --version
+
+      - name: Stage 4 - Install dependencies
+        run: npm ci
+
+      - name: Stage 5 - Validate application syntax
+        run: node --check server.js
+
+      - name: Stage 6 - Run unit tests
+        run: npm test
+
+      - name: Stage 7 - Dependency security scan
+        run: npm audit --audit-level=high
+
+      - name: Stage 8 - OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@1.1.0
+        with:
+          project: ${{ env.APP_NAME }}
+          path: .
+          format: HTML
+          out: dependency-check-report
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+            --exclude "**/node_modules/**"
+            --exclude "dist/**"
+
+      - name: Stage 9 - Upload OWASP Dependency-Check report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-dependency-check-report
+          path: dependency-check-report
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Stage 10 - SonarQube analysis
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' && env.SONAR_PROJECT_KEY != '' }}
+        uses: SonarSource/sonarqube-scan-action@v5.3.1
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=node_modules/**,dist/**
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+
+      - name: Stage 11 - SonarQube quality gate
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' && env.SONAR_PROJECT_KEY != '' }}
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+
+      - name: Stage 12 - Archive build artifact
+        run: |
+          mkdir -p dist
+          tar \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='dist' \
+            -czf "${ARTIFACT_PATH}" \
+            package.json package-lock.json server.js public views
+
+      - name: Stage 13 - Upload GitHub build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chucknorris-app
+          path: ${{ env.ARTIFACT_PATH }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stage 14 - Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: github-actions-chucknorris-${{ github.run_id }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Stage 15 - Upload artifact to S3
+        run: |
+          aws s3 cp "${ARTIFACT_PATH}" "${S3_URI}"
+
+      - name: Stage 16 - Deploy to target EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${EC2_SSH_PRIVATE_KEY}" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          ssh-keyscan -p "${EC2_PORT}" -H "${EC2_HOST}" >> ~/.ssh/known_hosts
+
+          ssh -p "${EC2_PORT}" -i ~/.ssh/ec2_key "${EC2_USER}@${EC2_HOST}" \
+            "APP_NAME='${APP_NAME}' APP_DIR='${APP_DIR}' APP_PORT='${APP_PORT}' ARTIFACT_NAME='${ARTIFACT_NAME}' RELEASE_SHA='${GITHUB_SHA}' S3_URI='${S3_URI}' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "AWS CLI is required on the EC2 instance so it can download the build artifact from S3." >&2
+            exit 1
+          fi
+
+          if ! command -v node >/dev/null 2>&1; then
+            echo "Node.js is required on the EC2 instance. Install Node.js 20 or newer, then rerun this workflow." >&2
+            exit 1
+          fi
+
+          if ! command -v npm >/dev/null 2>&1; then
+            echo "npm is required on the EC2 instance. Install npm, then rerun this workflow." >&2
+            exit 1
+          fi
+
+          if [ ! -d "${APP_DIR}" ]; then
+            sudo mkdir -p "${APP_DIR}"
+            sudo chown -R "$(id -un):$(id -gn)" "${APP_DIR}"
+          fi
+
+          mkdir -p "${APP_DIR}/releases"
+          RELEASE_DIR="${APP_DIR}/releases/${RELEASE_SHA}"
+          rm -rf "${RELEASE_DIR}"
+          mkdir -p "${RELEASE_DIR}"
+
+          aws s3 cp "${S3_URI}" "/tmp/${ARTIFACT_NAME}"
+          tar -xzf "/tmp/${ARTIFACT_NAME}" -C "${RELEASE_DIR}"
+          cd "${RELEASE_DIR}"
+          npm ci --omit=dev
+
+          ln -sfn "${RELEASE_DIR}" "${APP_DIR}/current"
+          cd "${APP_DIR}/current"
+
+          if ! command -v pm2 >/dev/null 2>&1; then
+            sudo npm install -g pm2
+          fi
+
+          if pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
+            PORT="${APP_PORT}" pm2 restart "${APP_NAME}" --update-env
+          else
+            PORT="${APP_PORT}" pm2 start server.js --name "${APP_NAME}"
+          fi
+
+          pm2 save || true
+          rm -f "/tmp/${ARTIFACT_NAME}"
+
+          for attempt in $(seq 1 10); do
+            if curl -fsS "http://127.0.0.1:${APP_PORT}/" >/dev/null; then
+              echo "Application health check passed."
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "Application did not pass health check on port ${APP_PORT}." >&2
+          exit 1
+          REMOTE
