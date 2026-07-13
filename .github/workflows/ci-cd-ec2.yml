@@ -143,12 +143,16 @@ jobs:
           chmod 600 ~/.ssh/ec2_key
           ssh-keyscan -p "${EC2_PORT}" -H "${EC2_HOST}" >> ~/.ssh/known_hosts
 
+          PRESIGNED_ARTIFACT_URL="$(aws s3 presign "${S3_URI}" --expires-in 900)"
+          echo "::add-mask::${PRESIGNED_ARTIFACT_URL}"
+          PRESIGNED_ARTIFACT_URL_B64="$(printf '%s' "${PRESIGNED_ARTIFACT_URL}" | base64 -w 0)"
+
           ssh -p "${EC2_PORT}" -i ~/.ssh/ec2_key "${EC2_USER}@${EC2_HOST}" \
-            "APP_NAME='${APP_NAME}' APP_DIR='${APP_DIR}' APP_PORT='${APP_PORT}' ARTIFACT_NAME='${ARTIFACT_NAME}' RELEASE_SHA='${GITHUB_SHA}' S3_URI='${S3_URI}' bash -s" <<'REMOTE'
+            "APP_NAME='${APP_NAME}' APP_DIR='${APP_DIR}' APP_PORT='${APP_PORT}' ARTIFACT_NAME='${ARTIFACT_NAME}' RELEASE_SHA='${GITHUB_SHA}' PRESIGNED_ARTIFACT_URL_B64='${PRESIGNED_ARTIFACT_URL_B64}' bash -s" <<'REMOTE'
           set -euo pipefail
 
-          if ! command -v aws >/dev/null 2>&1; then
-            echo "AWS CLI is required on the EC2 instance so it can download the build artifact from S3." >&2
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "curl is required on the EC2 instance so it can download the build artifact." >&2
             exit 1
           fi
 
@@ -172,7 +176,8 @@ jobs:
           rm -rf "${RELEASE_DIR}"
           mkdir -p "${RELEASE_DIR}"
 
-          aws s3 cp "${S3_URI}" "/tmp/${ARTIFACT_NAME}"
+          PRESIGNED_ARTIFACT_URL="$(printf '%s' "${PRESIGNED_ARTIFACT_URL_B64}" | base64 -d)"
+          curl -fL --retry 3 --retry-delay 5 -o "/tmp/${ARTIFACT_NAME}" "${PRESIGNED_ARTIFACT_URL}"
           tar -xzf "/tmp/${ARTIFACT_NAME}" -C "${RELEASE_DIR}"
           cd "${RELEASE_DIR}"
           npm ci --omit=dev
